@@ -9,12 +9,19 @@ import play.api.libs.json._
 import scala.collection.JavaConversions._
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.{ExecutionContext, Future}
+import scala.util.{Success, Failure}
+
 
 case class Vector3(x: Float, y: Float, z: Float)
 
 case class Matrix4(values: Array[Float])
 
-case class Login(prefix: String, name: String, game: String)
+case class Login(prefix: String, name: String, game: String, var hellosReceived: Int = 0)
+
+object Login {
+  def apply(prefix: String, name: String, game: String): Login = new Login(prefix, name, game)
+}
+
 
 case class Message(id: String, msg: String, full: String) {
   val ttl = System.currentTimeMillis() + 200
@@ -51,6 +58,7 @@ class MyWebSocketActor(out: ActorRef)(implicit ec: ExecutionContext) extends Act
     ticker = ticker + 1
     if (ticker % 320 == 0) {
       Logger.info("-----------------------------------------------------")
+      Logger.info(s"login info ${login}")
       Logger.info(s"Objects commonObjects=${game.commonObjectIds.size()} entries=${game.entries.size()} messages=${game.messages.size} remove=${game.remove.size} sentMessages=${game.sentMessages.size()}")
       for (o <- game.entries.values()) {
         Logger.info(o.id + " " + o.what + " " + o.state + " " + o.full)
@@ -65,6 +73,9 @@ class MyWebSocketActor(out: ActorRef)(implicit ec: ExecutionContext) extends Act
         }
       }
       Logger.info(s"skippedCommon=${skippedCommon} commonSent=${commonSent}")
+      if (game.created + GameObject.GAME_TIME < System.currentTimeMillis()) {
+        Logger.info("******* Game Over ********************")
+      }
       Logger.info("-----------------------------------------------------")
     }
   }
@@ -74,6 +85,8 @@ class MyWebSocketActor(out: ActorRef)(implicit ec: ExecutionContext) extends Act
       val json: JsValue = Json.parse(stringMessage)
       if (stringMessage.contains("HELLO")) {
         oktoSend = true
+        login.get.hellosReceived = login.get.hellosReceived + 1
+        sendToClient
       } else if (login.isEmpty) {
         json.validate[Login] match {
           case s: JsSuccess[Login] => {
@@ -84,7 +97,12 @@ class MyWebSocketActor(out: ActorRef)(implicit ec: ExecutionContext) extends Act
             Logger.info("LOGGED IN " + " " + login + " " + s"game is ${login.get.game}" + game)
             game.playerIds.add(l.prefix)
 
-            sendMessagesToPlayer
+            /*
+            sendMessagesToPlayer onComplete {
+              case Success(ok) => Logger.info("thread complete ")
+              case Failure(t) => Logger.warn("thread error: " + t.getMessage)
+            }
+             */
           }
           case e: JsError => {
             Logger.info("ERROR " + e)
@@ -103,7 +121,7 @@ class MyWebSocketActor(out: ActorRef)(implicit ec: ExecutionContext) extends Act
                 val m = Message(genId, msg, stringMessage)
                 game.sentMessages.put(genId, m)
                 game.messages.add(m)
-                Logger.info("BROADCAST RECEIVED MESSAGE " + genId + " " + m + "  " + stringMessage)
+                Logger.debug("BROADCAST RECEIVED MESSAGE " + genId + " " + m + "  " + stringMessage)
 
               }
             } else {
@@ -143,7 +161,6 @@ class MyWebSocketActor(out: ActorRef)(implicit ec: ExecutionContext) extends Act
 
   def shouldIStopGame = {
     if (game.created + GameObject.GAME_TIME < System.currentTimeMillis()) {
-      Logger.info("******* Game Over ********************")
       for (prefix <- game.playerIds) {
         val genId = s"${prefix}_9"
         val m = Message(genId, "{\"id\":\"0\",\"msg\":\"GAME_OVER\"}", "{\"id\":\"0\",\"msg\":\"GAME_OVER\"}")
@@ -161,79 +178,87 @@ class MyWebSocketActor(out: ActorRef)(implicit ec: ExecutionContext) extends Act
         out ! g.full
       }
       while (end == false) {
-        while (!oktoSend && end == false) {
+
+        for (waitAWhile <- 0 to 3 if !oktoSend && !end) {
           Thread.sleep(5)
         }
+        if (!oktoSend) {
+          Logger.warn("DID NOT RECEIVE HELLO FROM " + login)
+        }
         oktoSend = false
-        val now = System.currentTimeMillis()
-
-        GameObject.ttl = now
-
-        shouldIStopGame
-
-        skippedCommon = 0
-        commonSent = 0
-        for (g <- game.commonObjectIds.values) {
-          //if (g.state == "ALIVE" && g.full.contains("\"changed\":1")){
-          if (g.state == "ALIVE" && g.changed >= CHANGED) {
-            out ! g.full
-            commonSent = commonSent + 1
-          } else {
-            skippedCommon = skippedCommon + 1
-          }
-        }
-
-        for (g <- game.entries.values()) {
-          if (g.state == "DEAD" || g.id.startsWith(login.get.prefix) == false) {
-            if (g.state == "DEAD") {
-              Logger.debug(login.get.prefix + " SEND " + g.ttl + " " + g.full)
-            }
-            out ! g.full
-
-            if (g.state == "DEAD") {
-              g.timeToDie
-              game.remove.put(g.id, g)
-            }
-          }
-        }
-        for (g <- game.remove.values()) {
-          if (g.ttl < GameObject.ttl) {
-            Logger.debug("REMOVE **" + " " + g.state + " " + "** " + " " + g)
-            out ! g.full
-            game.entries.remove(g.id)
-            if ((g.id.startsWith("C"))) {
-              // make sure we keep dead ones forever
-              game.commonObjectIds.put(g.id, g)
-            }
-          }
-        }
-        game.remove.clear()
-        for (msg <- game.messages.toList) {
-          if (msg.id == "0" || msg.id.startsWith(login.get.prefix)) {
-            Logger.info("SEND " + login.get.prefix + " " + msg.id + " " + msg.full)
-            out ! msg.full
-
-            val was = game.messages.size()
-            game.messages.removeIf(m => m.id == msg.id)
-            //game.messages.remove(msg)
-            println(s"MESSAGES WAS ${was} now ${game.messages.size()} ")
-          } else {
-            //Logger.debug("WONT SEND TO " + login.get.prefix + " " + msg.id + " " + msg.full)
-          }
-        }
-        val time = System.currentTimeMillis()
-        for (k <- game.sentMessages.keys().toArray) {
-          val m = game.sentMessages.get(k)
-          if (m.ttl < time) {
-            game.sentMessages.remove(k)
-          }
-        }
-        timeTaken += (System.currentTimeMillis() - now)
-        //Thread.sleep(10)
-        logEntries
+        sendToClient
       }
       Logger.info("Send message thread complete!!!!")
     }
+  }
+
+  private def sendToClient = {
+    val now = System.currentTimeMillis()
+
+    GameObject.ttl = now
+
+    shouldIStopGame
+
+    skippedCommon = 0
+    commonSent = 0
+    for (g <- game.commonObjectIds.values) {
+      if (g.state == "ALIVE" && g.changed >= CHANGED) {
+        out ! g.full
+        commonSent = commonSent + 1
+      } else {
+        skippedCommon = skippedCommon + 1
+      }
+    }
+
+    for (g <- game.entries.values()) {
+      if (g.state == "DEAD" || g.id.startsWith(login.get.prefix) == false) {
+        if (g.state == "DEAD") {
+          Logger.debug(login.get.prefix + " SEND " + g.ttl + " " + g.full)
+        }
+        out ! g.full
+
+        if (g.state == "DEAD") {
+          g.timeToDie
+          game.remove.put(g.id, g)
+        }
+      }
+    }
+    for (g <- game.remove.values()) {
+      if (g.ttl < GameObject.ttl) {
+        Logger.debug("REMOVE **" + " " + g.state + " " + "** " + " " + g)
+        out ! g.full
+        game.entries.remove(g.id)
+        if ((g.id.startsWith("C"))) {
+          // make sure we keep dead ones forever
+          game.commonObjectIds.put(g.id, g)
+        }
+      }
+    }
+    game.remove.clear()
+    for (msg <- game.messages.toList) {
+      if (msg.id == "0" || msg.id.startsWith(login.get.prefix)) {
+        Logger.debug("SEND " + login.get.prefix + " " + msg.id + " " + msg.full)
+        out ! msg.full
+
+        val was = game.messages.size()
+        game.messages.removeIf(m => m.id == msg.id)
+        //game.messages.remove(msg)
+      } else {
+        //Logger.debug("WONT SEND TO " + login.get.prefix + " " + msg.id + " " + msg.full)
+      }
+    }
+    val time = System.currentTimeMillis()
+    if (game.sentMessages.size() > 0) {
+      for (k <- game.sentMessages.keys().toArray) {
+        val m = game.sentMessages.get(k)
+        if (m != null && m.ttl < time) {
+          game.sentMessages.remove(k)
+        }
+      }
+    }
+    timeTaken += (System.currentTimeMillis() - now)
+    //Thread.sleep(10)
+    logEntries
   }
 
   private def cleanupOnClose = {
